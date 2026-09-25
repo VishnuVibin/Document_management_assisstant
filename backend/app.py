@@ -174,10 +174,157 @@ def document_to_dict(document):
     }
 
 
+#AI Integration
+
+def chunk_text(text, chunk_size=1000, overlap=200):
+
+    if not text:
+        return []
+
+    chunks = []
+
+    start = 0
+
+    while start < len(text):
+
+        end = start + chunk_size
+
+        chunk = text[start:end]
+
+        chunks.append(chunk)
+
+        start += chunk_size - overlap
+
+    return chunks
+
+def search_documents(question, documents, top_k=5):
+
+    question_words = set(
+        question.lower().split()
+    )
+
+    results = []
+
+    for document in documents:
+
+        text = document["extracted_text"] or ""
+
+        chunks = chunk_text(text)
+
+        for chunk in chunks:
+
+            chunk_words = set(
+                chunk.lower().split()
+            )
+
+            common_words = (
+                question_words & chunk_words
+            )
+
+            score = len(common_words)
+
+            if score > 0:
+
+                results.append({
+                    "score": score,
+                    "filename": document["filename"],
+                    "document_id": document["id"],
+                    "text": chunk
+                })
+
+    results.sort(
+        key=lambda x: x["score"],
+        reverse=True
+    )
+
+    return results[:top_k]
+
+def generate_ai_answer(question, context):
+
+    if not OPENROUTER_API_KEY:
+
+        raise Exception(
+            "OPENROUTER_API_KEY is not configured"
+        )
+
+
+    prompt = f"""
+You are a document question-answering assistant.
+
+Answer the user's question using ONLY the
+information provided in the document context.
+
+If the answer cannot be found in the documents,
+say:
+
+"I could not find the answer in the uploaded documents."
+
+Do not invent information.
+
+DOCUMENT CONTEXT:
+
+{context}
+
+USER QUESTION:
+
+{question}
+
+Provide a clear and concise answer.
+"""
+
+
+    response = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+
+        headers={
+            "Authorization":
+                f"Bearer {OPENROUTER_API_KEY}",
+
+            "Content-Type":
+                "application/json"
+        },
+
+        json={
+            "model":
+                "meta-llama/llama-3.1-8b-instruct",
+
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+
+            "temperature": 0.2
+        },
+
+        timeout=60
+    )
+
+
+    if response.status_code != 200:
+
+        print(
+            "OpenRouter error:",
+            response.text
+        )
+
+        raise Exception(
+            "AI service request failed"
+        )
+
+
+    data = response.json()
+
+
+    return (
+        data["choices"][0]
+        ["message"]["content"]
+    )
+
 # ============================================================
 # UPLOAD DOCUMENT
 # ============================================================
-
 
 
 @app.route("/api/documents/upload", methods=["POST"])
@@ -589,6 +736,184 @@ def file_too_large(error):
         "error": "File too large. Maximum size is 10 MB."
     }), 413
 
+
+@app.route("/api/chat", methods=["POST"])
+def chat():
+
+    data = request.get_json()
+
+
+    # --------------------------------
+    # Validate request
+    # --------------------------------
+
+    if not data:
+
+        return jsonify({
+            "error": "Request body is required"
+        }), 400
+
+
+    question = data.get("question")
+
+
+    if not question:
+
+        return jsonify({
+            "error": "Question is required"
+        }), 400
+
+
+    question = question.strip()
+
+
+    if not question:
+
+        return jsonify({
+            "error": "Question cannot be empty"
+        }), 400
+
+
+    # --------------------------------
+    # Get documents
+    # --------------------------------
+
+    connection = get_db_connection()
+
+
+    documents = connection.execute(
+        """
+        SELECT
+            id,
+            filename,
+            extracted_text
+        FROM documents
+        WHERE extracted_text IS NOT NULL
+        AND extracted_text != ''
+        """
+    ).fetchall()
+
+
+    connection.close()
+
+
+    if not documents:
+
+        return jsonify({
+            "answer":
+                "There are no documents with extracted text available.",
+            "sources": []
+        }), 200
+
+
+    # --------------------------------
+    # Search documents
+    # --------------------------------
+
+    search_results = search_documents(
+        question,
+        documents,
+        top_k=5
+    )
+
+
+    # --------------------------------
+    # No relevant context
+    # --------------------------------
+
+    if not search_results:
+
+        return jsonify({
+            "answer":
+                "I could not find the answer in the uploaded documents.",
+            "sources": []
+        }), 200
+
+
+    # --------------------------------
+    # Build context
+    # --------------------------------
+
+    context_parts = []
+
+
+    for index, result in enumerate(
+        search_results
+    ):
+
+        context_parts.append(
+            f"""
+SOURCE {index + 1}
+
+Document:
+{result['filename']}
+
+Content:
+{result['text']}
+"""
+        )
+
+
+    context = "\n".join(
+        context_parts
+    )
+
+
+    # --------------------------------
+    # Generate AI answer
+    # --------------------------------
+
+    try:
+
+        answer = generate_ai_answer(
+            question,
+            context
+        )
+
+
+    except Exception as error:
+
+        print(
+            "AI error:",
+            error
+        )
+
+        return jsonify({
+            "error":
+                "Failed to generate AI answer"
+        }), 500
+
+
+    # --------------------------------
+    # Prepare sources
+    # --------------------------------
+
+    sources = []
+
+
+    for result in search_results:
+
+        sources.append({
+            "document_id":
+                result["document_id"],
+
+            "filename":
+                result["filename"],
+
+            "text":
+                result["text"]
+        })
+
+
+    # --------------------------------
+    # Return response
+    # --------------------------------
+
+    return jsonify({
+
+        "answer": answer
+
+    }), 200
 
 # ============================================================
 # HEALTH CHECK
